@@ -40,6 +40,37 @@ type FilterPolicy interface {
 	MayContain(filter, key []byte) bool
 }
 
+// BlockCacheStats holds hit/miss counters for a BlockCache.
+type BlockCacheStats struct {
+	Hits       int64 // Number of Get calls that returned cached data.
+	Misses     int64 // Number of Get calls that returned nil.
+	Evictions  int64 // Number of entries evicted to make room.
+	Entries    int   // Current number of cached blocks.
+}
+
+// BlockCache is an interface for caching decompressed SSTable data blocks.
+// Implementations must be safe for concurrent use if the Reader is accessed
+// from multiple goroutines. The cache key is the block's byte offset within
+// the SSTable file.
+//
+// To implement a custom eviction strategy, implement this interface.
+// For the default LRU implementation, use table.NewLRUBlockCache(capacity).
+type BlockCache interface {
+	// Get returns the cached block for the given offset, or nil if not cached.
+	// On a hit, the implementation should mark the entry as recently used.
+	Get(offset uint64) []byte
+
+	// Put stores a decompressed block in the cache, keyed by its file offset.
+	// If the cache is full, the implementation decides which entry to evict.
+	Put(offset uint64, data []byte)
+
+	// Stats returns current cache hit/miss/eviction counters.
+	Stats() BlockCacheStats
+
+	// Close releases all cached blocks and any resources held by the cache.
+	Close()
+}
+
 // Options holds the optional parameters for leveldb's DB implementations.
 // These options apply to the DB at large; per-query options are defined by
 // the ReadOptions and WriteOptions types.
@@ -127,6 +158,18 @@ type Options struct {
 	//
 	// The default value is false.
 	VerifyChecksums bool
+
+	// BlockCache is an optional cache for decompressed data blocks.
+	// When set, the table Reader caches blocks after decompression and
+	// returns cached copies on subsequent reads, avoiding repeated disk
+	// I/O and snappy.Decode allocations.
+	//
+	// A nil value (the default) disables block caching.
+	//
+	// Use table.NewLRUBlockCache(capacity) for the default LRU
+	// implementation, or implement the BlockCache interface for a
+	// custom eviction strategy.
+	BlockCache BlockCache
 }
 
 func (o *Options) GetBlockRestartInterval() int {
@@ -198,6 +241,13 @@ func (o *Options) GetVerifyChecksums() bool {
 		return false
 	}
 	return o.VerifyChecksums
+}
+
+func (o *Options) GetBlockCache() BlockCache {
+	if o == nil {
+		return nil
+	}
+	return o.BlockCache
 }
 
 // ReadOptions hold the optional per-query parameters for Get and Find

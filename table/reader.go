@@ -298,7 +298,7 @@ type Reader struct {
 	comparer        db.Comparer
 	filter          filterReader
 	verifyChecksums bool
-	// TODO: add a (goroutine-safe) LRU block cache.
+	blockCache      db.BlockCache // nil = disabled (opt-in via db.Options)
 }
 
 // Reader implements the db.DB interface.
@@ -319,6 +319,11 @@ func (r *Reader) Close() error {
 		if r.err != nil {
 			return r.err
 		}
+	}
+	// Release cached blocks.
+	if r.blockCache != nil {
+		r.blockCache.Close()
+		r.blockCache = nil
 	}
 	// Make any future calls to Get, Find or Close return an error.
 	r.err = errors.New("leveldb/table: reader is closed")
@@ -379,7 +384,17 @@ func (r *Reader) find(key []byte, o *db.ReadOptions, f *filterReader) db.Iterato
 }
 
 // readBlock reads and decompresses a block from disk into memory.
+// If a block cache is configured, it checks the cache first and
+// stores decompressed blocks for reuse on subsequent reads.
 func (r *Reader) readBlock(bh blockHandle) (block, error) {
+	// Check cache.
+	if r.blockCache != nil {
+		if cached := r.blockCache.Get(bh.offset); cached != nil {
+			return cached, nil
+		}
+	}
+
+	// Cache miss — read and decompress from disk.
 	b := make([]byte, bh.length+blockTrailerLen)
 	if _, err := r.file.ReadAt(b, int64(bh.offset)); err != nil {
 		return nil, err
@@ -391,17 +406,26 @@ func (r *Reader) readBlock(bh blockHandle) (block, error) {
 			return nil, errors.New("leveldb/table: invalid table (checksum mismatch)")
 		}
 	}
+	var result block
 	switch b[bh.length] {
 	case noCompressionBlockType:
-		return b[:bh.length], nil
+		result = b[:bh.length]
 	case snappyCompressionBlockType:
-		b, err := snappy.Decode(nil, b[:bh.length])
+		decoded, err := snappy.Decode(nil, b[:bh.length])
 		if err != nil {
 			return nil, err
 		}
-		return b, nil
+		result = decoded
+	default:
+		return nil, fmt.Errorf("leveldb/table: unknown block compression: %d", b[bh.length])
 	}
-	return nil, fmt.Errorf("leveldb/table: unknown block compression: %d", b[bh.length])
+
+	// Store in cache.
+	if r.blockCache != nil {
+		r.blockCache.Put(bh.offset, result)
+	}
+
+	return result, nil
 }
 
 func (r *Reader) readMetaindex(metaindexBH blockHandle, o *db.Options) error {
@@ -459,6 +483,9 @@ func NewReader(f db.File, o *db.Options) *Reader {
 		file:            f,
 		comparer:        o.GetComparer(),
 		verifyChecksums: o.GetVerifyChecksums(),
+		// blockCache is set after index/metaindex reads below to
+		// avoid wasting cache slots on blocks that are already
+		// stored permanently in Reader fields.
 	}
 	if f == nil {
 		r.err = errors.New("leveldb/table: nil file")
@@ -502,5 +529,9 @@ func NewReader(f db.File, o *db.Options) *Reader {
 		return r
 	}
 	r.index, r.err = r.readBlock(indexBH)
+
+	// Enable block cache for data blocks only. Set after index/metaindex
+	// reads so those one-time blocks don't consume cache slots.
+	r.blockCache = o.GetBlockCache()
 	return r
 }
